@@ -1,0 +1,8 @@
+node_modules/
+.next/
+out/
+.env*
+!.env.example
+.sites-runtime/
+*.tsbuildinfo
+.claude/scheduled_tasks.lock
