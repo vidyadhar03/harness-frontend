@@ -142,6 +142,27 @@ export type SourceUploadResult = {
   error: string | null;
 };
 
+// GET /projects/{id}/sources - authoritative, uploaded-ingestion-inputs-only listing
+// (excludes reference-pipeline-fetched images; see API_CONTRACT.md). No docType or
+// timestamp field exists here on purpose - don't infer either from this shape.
+export type SourceSummary = {
+  id: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  status: SourceStatus;
+  error: string | null;
+};
+
+// POST /projects/{id}/locations/{lid}/references/upload - response shape
+export type ReferenceUploadResult = {
+  noteId: string;
+  imagePath: string;
+  created: boolean;
+  status: NoteStatus;
+  revision: number;
+};
+
 const enc = encodeURIComponent;
 
 export function listProjects(signal?: AbortSignal) {
@@ -150,6 +171,10 @@ export function listProjects(signal?: AbortSignal) {
 
 export function getProject(projectId: string, signal?: AbortSignal) {
   return apiGet<ProjectDetail>(`/projects/${enc(projectId)}`, undefined, { signal });
+}
+
+export function listSources(projectId: string, signal?: AbortSignal) {
+  return apiGet<SourceSummary[]>(`/projects/${enc(projectId)}/sources`, undefined, { signal });
 }
 
 export function listLocations(projectId: string, signal?: AbortSignal) {
@@ -228,6 +253,25 @@ export function uploadSource(
 ) {
   const qs = `?filename=${enc(filename)}`;
   return uploadRaw<SourceUploadResult>(`/projects/${enc(projectId)}/sources${qs}`, file, opts);
+}
+
+/**
+ * POST /projects/{projectId}/locations/{locationId}/references/upload - raw request body
+ * is the image's own bytes (JPEG, PNG, WebP), filename passed as query param.
+ */
+export function uploadLocationReference(
+  projectId: string,
+  locationId: string,
+  file: Blob,
+  filename: string,
+  opts: { onProgress?: (pct: number | null) => void; signal?: AbortSignal } = {},
+) {
+  const qs = `?filename=${enc(filename)}`;
+  return uploadRaw<ReferenceUploadResult>(
+    `/projects/${enc(projectId)}/locations/${enc(locationId)}/references/upload${qs}`,
+    file,
+    opts,
+  );
 }
 
 export function startIngest(

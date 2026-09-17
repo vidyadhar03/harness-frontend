@@ -14,6 +14,7 @@ import {
   FileWarning,
   FolderPlus,
   Image as ImageIcon,
+  Info,
   Layers,
   Link2,
   LoaderCircle,
@@ -36,23 +37,24 @@ import {
   createReferenceJob,
   getJob,
   getLocation,
-  getProject,
   listLocations,
   listProjects,
   listReferences,
+  listSources,
   resolveImageUrl,
   reviewNote,
   startIngest,
+  uploadLocationReference,
   uploadSource,
   type IngestOutcome,
   type IngestSourceResult,
   type JobStatusResult,
   type LocationDetail,
   type LocationSummary,
-  type ProjectDetail,
   type ProjectSummary,
   type ReferenceNote,
   type RejectReason,
+  type SourceSummary,
   type SourceUploadResult,
 } from "../lib/harness";
 import {
@@ -78,9 +80,18 @@ type UploadRow = {
   id: string;
   file: File;
   filename: string;
-  state: UploadRowState;
+  state: "queued" | "uploading" | "done" | "error";
   progressPct: number | null;
+  errorMessage?: string;
   result?: SourceUploadResult;
+};
+
+type RefUploadRow = {
+  id: string;
+  file: File;
+  filename: string;
+  state: "queued" | "uploading" | "done" | "already_attached" | "error";
+  progressPct: number | null;
   errorMessage?: string;
 };
 
@@ -126,7 +137,6 @@ export default function ConnectedStudio() {
   const [projectsError, setProjectsError] = useState<string | null>(null);
 
   const [projectId, setProjectId] = useState<string | null>(null);
-  const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(null);
 
   const [locations, setLocations] = useState<LocationSummary[]>([]);
   const [locationsLoading, setLocationsLoading] = useState(false);
@@ -168,6 +178,20 @@ export default function ConnectedStudio() {
   const [uploadRows, setUploadRows] = useState<UploadRow[]>([]);
   const fileInput = useRef<HTMLInputElement>(null);
 
+  // --- location reference image upload ---
+  const refFileInput = useRef<HTMLInputElement>(null);
+  const [refUploadBusy, setRefUploadBusy] = useState(false);
+  const [refUploadRows, setRefUploadRows] = useState<RefUploadRow[]>([]);
+  const [refUploadBatchScope, setRefUploadBatchScope] = useState<string | null>(null);
+  const refUploadBatchScopeRef = useRef<string | null>(null);
+
+  // --- authoritative uploaded-source list (GET /projects/{id}/sources) - separate from
+  // the transient uploadRows above, which log individual upload *attempts* (including
+  // repeats) rather than the deduped, server-persisted set. ---
+  const [sources, setSources] = useState<SourceSummary[]>([]);
+  const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [sourcesError, setSourcesError] = useState<string | null>(null);
+
   // --- ingest job (project-scoped, separate from location reference jobs) ---
   const [ingestJobId, setIngestJobId] = useState<string | null>(null);
   const [ingestBusy, setIngestBusy] = useState(false);
@@ -179,6 +203,7 @@ export default function ConnectedStudio() {
   const locationsAbort = useRef<AbortController | null>(null);
   const detailAbort = useRef<AbortController | null>(null);
   const referencesAbort = useRef<AbortController | null>(null);
+  const sourcesAbort = useRef<AbortController | null>(null);
   const pollingScopes = useRef<Set<string>>(new Set());
   const pollingIngestProjects = useRef<Set<string>>(new Set());
   const uploadBatchProjectIdRef = useRef<string | null>(null);
@@ -239,9 +264,8 @@ export default function ConnectedStudio() {
     const signal = nextSignal(locationsAbort);
     setLocationsLoading(true);
     setLocationsError(null);
-    Promise.all([getProject(pid, signal), listLocations(pid, signal)])
-      .then(([pd, locs]) => {
-        setProjectDetail(pd);
+    listLocations(pid, signal)
+      .then((locs) => {
         setLocations(locs);
         setLocationsLoading(false);
         const last = getLastSelection();
@@ -257,7 +281,23 @@ export default function ConnectedStudio() {
         setLocationsError(describeError(e));
         setLocations([]);
         setLocationId(null);
-        setProjectDetail(null);
+      });
+  }
+
+  function loadSources(pid: string) {
+    const signal = nextSignal(sourcesAbort);
+    setSourcesLoading(true);
+    setSourcesError(null);
+    listSources(pid, signal)
+      .then((data) => {
+        setSources(data);
+        setSourcesLoading(false);
+      })
+      .catch((e) => {
+        if (isAbortError(e)) return;
+        setSourcesLoading(false);
+        setSourcesError(describeError(e));
+        setSources([]);
       });
   }
 
@@ -265,11 +305,12 @@ export default function ConnectedStudio() {
     if (!projectId) {
       setLocations([]);
       setLocationId(null);
-      setProjectDetail(null);
+      setSources([]);
       return;
     }
     setLastSelection({ projectId, locationId: null });
     loadLocations(projectId);
+    loadSources(projectId);
 
     // Ingest state belongs to whichever project is selected - clear the previous
     // project's terminal result from view, then check whether *this* project has a
@@ -498,13 +539,95 @@ export default function ConnectedStudio() {
         );
       }
     }
-    // Refresh the project's source count (a real, if coarse, backend-confirmed signal) -
-    // but only apply it if that project is still the one on screen.
-    getProject(batchProjectId)
-      .then((pd) => {
-        if (activeProjectRef.current === batchProjectId) setProjectDetail(pd);
-      })
-      .catch(() => {});
+    // Refresh the authoritative source list - but only if that project is still the
+    // one on screen; if the user switched away mid-batch, leave it alone (returning to
+    // that project re-fetches fresh via the project-change effect anyway).
+    if (activeProjectRef.current === batchProjectId) loadSources(batchProjectId);
+  }
+
+  // --- location reference image upload (raw image body, sequential) ---
+
+  async function handlePickReferenceFiles(files: FileList | null) {
+    if (!files || !files.length || !projectId || !locationId) return;
+    const targetPid = projectId;
+    const targetLid = locationId;
+    const batchScope = `${targetPid}:${targetLid}`;
+    refUploadBatchScopeRef.current = batchScope;
+    setRefUploadBatchScope(batchScope);
+    setRefUploadBusy(true);
+
+    const fileList = Array.from(files);
+    const newRows: RefUploadRow[] = fileList.map((file) => ({
+      id: uid(),
+      file,
+      filename: file.name,
+      state: "queued",
+      progressPct: null,
+    }));
+    setRefUploadRows(newRows);
+
+    let createdCount = 0;
+    let duplicateCount = 0;
+    let errorCount = 0;
+
+    for (const row of newRows) {
+      setRefUploadRows((prev) =>
+        prev.map((r) => (r.id === row.id ? { ...r, state: "uploading" } : r)),
+      );
+
+      try {
+        const result = await uploadLocationReference(targetPid, targetLid, row.file, row.filename, {
+          onProgress: (pct) =>
+            setRefUploadRows((prev) =>
+              prev.map((r) => (r.id === row.id ? { ...r, progressPct: pct } : r)),
+            ),
+        });
+
+        if (result.created) {
+          createdCount++;
+          setRefUploadRows((prev) =>
+            prev.map((r) => (r.id === row.id ? { ...r, state: "done" } : r)),
+          );
+        } else {
+          duplicateCount++;
+          setRefUploadRows((prev) =>
+            prev.map((r) => (r.id === row.id ? { ...r, state: "already_attached" } : r)),
+          );
+        }
+      } catch (e) {
+        errorCount++;
+        const msg = describeError(e);
+        setRefUploadRows((prev) =>
+          prev.map((r) =>
+            r.id === row.id ? { ...r, state: "error", errorMessage: msg } : r,
+          ),
+        );
+      }
+    }
+
+    setRefUploadBusy(false);
+
+    // Only update and trigger notice if the user is STILL on the original location scope
+    if (activeScopeRef.current === batchScope) {
+      if (createdCount > 0) {
+        loadReferences(targetPid, targetLid);
+      }
+      if (duplicateCount > 0 && createdCount === 0 && errorCount === 0) {
+        setNotice(
+          duplicateCount === 1
+            ? "Image already attached to this location."
+            : `${duplicateCount} images already attached to this location.`,
+        );
+      } else if (createdCount > 0 && duplicateCount > 0) {
+        setNotice(
+          `${createdCount} reference(s) uploaded, ${duplicateCount} already attached.`,
+        );
+      } else if (createdCount > 0) {
+        setNotice(
+          `${createdCount} reference image(s) uploaded.`,
+        );
+      }
+    }
   }
 
   // --- ingest trigger + poll (project-scoped; separate pending-job storage from the
@@ -549,6 +672,9 @@ export default function ConnectedStudio() {
             setIngestBusy(false);
             setIngestStatus(job);
             setIngestStatusProjectId(pid);
+            // Source statuses/errors change on a failed run too (e.g. a source now
+            // shows status "failed") - refresh the authoritative list either way.
+            loadSources(pid);
           }
           return;
         }
@@ -558,6 +684,7 @@ export default function ConnectedStudio() {
             setIngestBusy(false);
             setIngestStatus(job);
             setIngestStatusProjectId(pid);
+            loadSources(pid);
           }
           // Authoritative refetch, including partial outcomes - they can still have
           // produced usable locations worth surfacing.
@@ -863,7 +990,10 @@ export default function ConnectedStudio() {
             {view === "sources" && projectId ? (
               <SourcesPanel
                 projectName={currentProject?.name ?? null}
-                projectDetail={projectId === projectDetail?.id ? projectDetail : null}
+                sources={sources}
+                sourcesLoading={sourcesLoading}
+                sourcesError={sourcesError}
+                onRetrySources={() => projectId && loadSources(projectId)}
                 uploadRows={visibleUploadRows}
                 foreignBatchCount={foreignBatchCount}
                 onPickFiles={() => fileInput.current?.click()}
@@ -1019,12 +1149,60 @@ export default function ConnectedStudio() {
                         <p>Confirm the references worth keeping, reject the rest.</p>
                       </div>
                       <div className="button-row">
-                        <button className="primary" disabled={busy} onClick={startReferenceJob}>
+                        <button
+                          className="outline"
+                          disabled={busy || refUploadBusy || !locationId}
+                          onClick={() => refFileInput.current?.click()}
+                        >
+                          {refUploadBusy ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}
+                          Upload reference
+                        </button>
+                        <button className="primary" disabled={busy || refUploadBusy} onClick={startReferenceJob}>
                           {busy ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}
                           Find inspiration
                         </button>
                       </div>
                     </div>
+                    {refUploadBatchScope === `${projectId}:${locationId}` && refUploadRows.length > 0 && (
+                      <div className="upload-list ref-upload-list" style={{ marginBottom: "16px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                          <span className="hint" style={{ fontWeight: 600 }}>Reference uploads</span>
+                          {!refUploadBusy && (
+                            <button
+                              className="icon"
+                              onClick={() => setRefUploadRows([])}
+                              title="Clear upload list"
+                              aria-label="Clear upload list"
+                            >
+                              <X size={14} />
+                            </button>
+                          )}
+                        </div>
+                        {refUploadRows.map((r) => (
+                          <div
+                            key={r.id}
+                            className={`upload-row upload-row-${r.state === "already_attached" ? "done" : r.state}`}
+                          >
+                            <span className="upload-row-icon">
+                              {r.state === "queued" && <Circle size={14} />}
+                              {r.state === "uploading" && <LoaderCircle className="spin" size={16} />}
+                              {r.state === "done" && <CheckCircle2 size={16} />}
+                              {r.state === "already_attached" && <Info size={16} />}
+                              {r.state === "error" && <XCircle size={16} />}
+                            </span>
+                            <span className="upload-row-name">{r.filename}</span>
+                            <span className="upload-row-status">
+                              {r.state === "queued" && "Queued…"}
+                              {r.state === "uploading" &&
+                                (r.progressPct !== null ? `Uploading… ${r.progressPct}%` : "Uploading…")}
+                              {r.state === "done" && "Uploaded"}
+                              {r.state === "already_attached" && "Already attached to this location"}
+                              {r.state === "error" && (r.errorMessage || "Failed")}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     {referencesLoading && <div className="hint">Loading references…</div>}
                     {referencesError && (
                       <div className="error-banner">
@@ -1174,6 +1352,17 @@ export default function ConnectedStudio() {
         hidden
         onChange={(e) => {
           void startUploadBatch(e.target.files);
+          e.target.value = "";
+        }}
+      />
+      <input
+        ref={refFileInput}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        multiple
+        hidden
+        onChange={(e) => {
+          void handlePickReferenceFiles(e.target.files);
           e.target.value = "";
         }}
       />
@@ -1619,9 +1808,37 @@ function SourceResultRow({ s }: { s: IngestSourceResult }) {
   );
 }
 
+// Authoritative GET /projects/{id}/sources row. Deliberately shows only filename,
+// status and the source's own error - no docType or timestamp exists on this shape
+// (see API_CONTRACT.md), so none is invented here.
+function SourceListRow({ s }: { s: SourceSummary }) {
+  return (
+    <div className={`source-list-row source-list-${s.status}`}>
+      <span className="upload-row-icon">
+        {s.status === "uploaded" && <Circle size={14} />}
+        {s.status === "digesting" && <LoaderCircle className="spin" size={16} />}
+        {s.status === "digested" && <CheckCircle2 size={16} />}
+        {s.status === "failed" && <XCircle size={16} />}
+        {s.status === "unsupported" && <FileWarning size={16} />}
+      </span>
+      <span className="upload-row-name">{s.filename}</span>
+      <span className="upload-row-status">
+        {s.status === "uploaded" && "Uploaded, not yet processed"}
+        {s.status === "digesting" && "Processing…"}
+        {s.status === "digested" && "Processed"}
+        {s.status === "unsupported" && (s.error || "Unsupported file type")}
+        {s.status === "failed" && (s.error || "Failed")}
+      </span>
+    </div>
+  );
+}
+
 function SourcesPanel({
   projectName,
-  projectDetail,
+  sources,
+  sourcesLoading,
+  sourcesError,
+  onRetrySources,
   uploadRows,
   foreignBatchCount,
   onPickFiles,
@@ -1634,7 +1851,10 @@ function SourcesPanel({
   onContinueToLocations,
 }: {
   projectName: string | null;
-  projectDetail: ProjectDetail | null;
+  sources: SourceSummary[];
+  sourcesLoading: boolean;
+  sourcesError: string | null;
+  onRetrySources: () => void;
   uploadRows: UploadRow[];
   foreignBatchCount: number;
   onPickFiles: () => void;
@@ -1683,23 +1903,34 @@ function SourcesPanel({
         </div>
       )}
 
-      {projectDetail && (
-        <p className="hint">
-          {projectDetail.sourceCount} source(s) uploaded to this project in total
-          {uploadRows.length > 0 ? " (including earlier sessions, if any)" : ""}. The API doesn&apos;t
-          yet expose a list of them - see the report for the proposed addition.
-        </p>
-      )}
+      <NoteGroup title="Uploaded sources">
+        {sourcesLoading && <p className="hint">Loading sources…</p>}
+        {!sourcesLoading && sourcesError && (
+          <div className="error-banner">
+            {sourcesError}{" "}
+            <button className="retry-link" onClick={onRetrySources}>
+              Retry
+            </button>
+          </div>
+        )}
+        {!sourcesLoading && !sourcesError && sources.length === 0 && (
+          <p className="hint">No sources uploaded yet.</p>
+        )}
+        {!sourcesLoading && !sourcesError && sources.length > 0 && (
+          <div className="upload-list">
+            {sources.map((s) => (
+              <SourceListRow key={s.id} s={s} />
+            ))}
+          </div>
+        )}
+      </NoteGroup>
 
       <div className="ingest-action">
         <button className="primary" onClick={onStartIngest} disabled={ingestBusy || anyUploadInFlight}>
           {ingestBusy ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}
           Process sources
         </button>
-        <p className="hint">
-          Processes every eligible source already uploaded to this project - not just the ones
-          shown above.
-        </p>
+        <p className="hint">Processes every source listed above that&apos;s eligible.</p>
       </div>
 
       {ingestBusy && !ingestPaused && (

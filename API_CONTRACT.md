@@ -62,6 +62,55 @@ Response `201`:
 - No JSON/`Content-Type` requirement on this route (the body isn't JSON) - only the
   `Origin` check applies, same as every other mutation.
 
+### `GET /projects/{projectId}/sources`
+Authoritative uploaded-source listing for the Sources screen - use this after a reload
+instead of trusting client-held upload responses, which don't survive a refresh.
+
+Response `200`:
+```json
+[
+  { "id": "<sha256a>", "filename": "Episode_1_Draft.pdf", "mimeType": "application/pdf",
+    "sizeBytes": 812433, "status": "digested", "error": null },
+  { "id": "<sha256b>", "filename": "director_notes.md", "mimeType": "text/markdown",
+    "sizeBytes": 4021, "status": "failed", "error": "OutputTruncated: roster pass truncated" }
+]
+```
+Fields (all always present; `error` may be `null`, nothing else is nullable):
+- `id` - sha256 of the file's bytes; stable, matches what `POST .../sources` returned
+  and what `POST .../ingest`'s `sourceId` expects.
+- `filename`, `mimeType`, `sizeBytes` - as recorded at upload time; unchanged by
+  ingestion.
+- `status` - one of `uploaded | digesting | digested | failed | unsupported`, the
+  harness's actual persisted `Source.status` at read time, not recomputed or inferred.
+  `digesting` is a real, if narrow, possibility - only if you `GET` while a job's
+  `_run_ingest` is mid-source, since that's set before the LLM call and cleared after.
+- `error` - the *source's own* last-recorded failure (`"no v0 handler for <mime>"` for
+  `unsupported`, or an ingestion exception's message for `failed`), taken verbatim from
+  the persisted record, never invented or reconstructed. **This is a different field
+  from an ingest job's `error`/`sources[].error`** (`GET .../jobs/{jobId}`, documented
+  above) - a source can show `error: null` here even while the most recent job that
+  touched this project failed for an unrelated reason (a different source, or a
+  lock/scheduling problem that never reached this one). Don't treat one as a summary of
+  the other; if you need "what happened in the last run," that's the job endpoint.
+
+Scope and ordering:
+- **Uploaded ingestion inputs only** - excludes images the *references* pipeline
+  fetched and stored as `Source` rows for its own purposes (visual inspiration, not
+  something anyone uploaded). A source's `docType` being `"reference"` is **not** the
+  signal used for this (a genuinely uploaded lookbook can be classified that way too);
+  the exclusion is internal to the harness and requires no client-side filtering -
+  every row returned here is something that was actually uploaded through
+  `POST .../sources`.
+- Ordered by upload time, oldest first (ties broken deterministically); stable across
+  repeated calls as long as the underlying data hasn't changed.
+- `404` for an unknown project. Empty project → `200 []`, not `404`.
+
+**Known limitation**: no `docType` (script/notes/lookbook/etc.) or timestamp is
+included in this first slice, even though the harness has both once a file is
+ingested - only the fields listed above. If the Sources screen wants to show a
+human-readable document type or "uploaded 3 days ago," that needs a small follow-up
+field addition, not something to infer from what's here.
+
 ### `POST /projects/{projectId}/ingest`
 ```json
 { "sourceId": null, "force": false }
@@ -203,6 +252,34 @@ isn't a reference or its source can't be resolved.
 
 ## Writes
 
+### `POST /projects/{projectId}/locations/{locationId}/references/upload?filename=...`
+Attaches a user-provided image directly as a reference note for a specific location.
+
+- **Request body**: raw image bytes (`Content-Type: image/jpeg | image/png | image/webp`).
+  Filename is passed as query parameter `filename`.
+- **Validation**:
+  - MIME must be `image/jpeg`, `image/png`, or `image/webp`.
+  - Image decoded within `MAX_REFERENCE_PIXELS` (16 MP). Corrupted or animated images (e.g. animated WebP, APNG) rejected with `400`.
+  - Body size bounded by `max_upload_bytes` (`413` if exceeded).
+  - Validates `locationId` belongs to `projectId` (`404` if unknown, `400` if ID belongs to a scene).
+- **Behavior**:
+  - Creates a location-owned reference note in `"proposed"` status with `author: "user"`.
+  - Does NOT call any LLM; no fake caption, direction, or external attribution is invented.
+  - Dedup: if the same image bytes are already attached to this location, returns `created: false` with the existing note's current status, revision, and guidance preserved.
+  - Cross-purpose: if the image bytes were previously uploaded via `POST /sources` (ingest), the existing source record is reused and retains its ingest eligibility. If uploaded here first, the source is stored with `source_purpose: "reference"` (not in `GET /sources`, not ingestible) until explicitly uploaded via `POST /sources` which atomically promotes it.
+- **Response `201`**:
+```json
+{
+  "noteId": "note_14b2d18080a2",
+  "imagePath": "/projects/prj_811abbb21145/references/note_14b2d18080a2/image",
+  "created": true,
+  "status": "proposed",
+  "revision": 1
+}
+```
+- Preview served via `GET {imagePath}` (`GET /projects/{projectId}/references/{noteId}/image`).
+- Reviewable via standard `POST /projects/{projectId}/notes/{noteId}/review`.
+
 ### `POST /projects/{projectId}/notes/{noteId}/review`
 ```json
 { "decision": "confirmed", "guidance": "canopy shape, not the bridge",
@@ -327,6 +404,10 @@ eventually show its real outcome.
    ingest job with `outcome` `"complete"` or `"partial"`, navigate to
    `GET /projects/{id}/locations`; on `"failed"` or `outcome: "no_op"`, show the
    per-source `sources` detail and let the user retry rather than advancing.
+   - **Reload/recovery**: don't rely on upload-response state surviving a refresh -
+     call `GET /projects/{id}/sources` (above) to repopulate the Sources screen
+     authoritatively, the same way an in-flight ingest job is reconnected via its saved
+     job id rather than client memory.
 
 ## Not yet built (do not assume these exist)
 
