@@ -67,22 +67,25 @@ async function send<T>(
   return r.json();
 }
 
-function toQueryString(
-  params: Record<string, string | number | boolean | undefined>,
-): string {
-  const entries = Object.entries(params).filter(([, v]) => v !== undefined);
-  if (!entries.length) return "";
-  return (
-    "?" +
-    entries
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-      .join("&")
-  );
+type QueryValue = string | number | boolean | undefined | string[];
+
+function toQueryString(params: Record<string, QueryValue>): string {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined) continue;
+    // Repeated key for an array (e.g. ?referenceIds=a&referenceIds=b) - matches
+    // FastAPI's list[str] query param convention used by the approval preview route.
+    const values = Array.isArray(v) ? v : [v];
+    for (const value of values) {
+      parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(value))}`);
+    }
+  }
+  return parts.length ? `?${parts.join("&")}` : "";
 }
 
 export function apiGet<T>(
   path: string,
-  params?: Record<string, string | number | boolean | undefined>,
+  params?: Record<string, QueryValue>,
   opts?: RequestOptions,
 ): Promise<T> {
   const qs = params ? toQueryString(params) : "";

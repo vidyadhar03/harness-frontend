@@ -195,12 +195,53 @@ phase (see "Not yet built" below); do not gate anything in Phase 1 on "brief app
   "descriptionNotes": [{ "id": "note_...", "kind": "description", "body": "...",
                          "status": "proposed", "revision": 1,
                          "citations": [{ "sourceId": "...", "filename": "Ep1.pdf",
-                                        "page": 5, "quote": "...", "url": null, "title": null }] }],
+                                        "page": 5, "quote": "...", "url": null, "title": null }],
+                         "sceneId": null, "includeDescendants": false }],
   "constraintNotes": [ ... same shape ... ],
   "toneNotes": [ ... same shape ... ],
   "supersededSources": []
 }
 ```
+`sceneId`/`includeDescendants` mirror the note's own `applicability` (null `sceneId` =
+standing, applies to the whole location) - present here and on every other note shape
+in this contract so a client can tell a standing note from a scene-scoped one without
+a separate lookup, e.g. before offering `POST .../notes/{noteId}/correct` below.
+
+**`sceneRequirements`** (additive - every field above is unchanged) is the scene-scoped
+half of the brief, which the three standing lists above never contain:
+```json
+"sceneRequirements": [
+  { "sceneId": "scn_c7d4...", "number": "4", "heading": "4. INT. ANSHUL'S HOUSE - NIGHT",
+    "linked": true, "notes": [] },
+  { "sceneId": "scn_8fc5...", "number": "7", "heading": "7. INT./EXT. PANDIT'S DREAM - NIGHT",
+    "linked": true,
+    "notes": [{ "id": "note_...", "kind": "description", "body": "...", "status": "proposed",
+                "revision": 1, "citations": [...], "sceneId": "scn_8fc5...",
+                "includeDescendants": false,
+                "ownerId": "loc_...", "owned": true, "inheritedFrom": null, "editable": true }] }
+],
+"outOfRosterSceneRequirements": []
+```
+- One entry per scene in `scenes` above (same roster, same order), whether or not it has
+  notes. `notes: []` means nothing scene-specific was extracted for that scene.
+- Each note carries everything `POST .../notes/{noteId}/correct` needs: `id`, `body`,
+  `kind`, `revision`, `status` (echo `revision`/`status` back as `expectedRevision`/
+  `expectedStatus`), plus `sceneId`, `includeDescendants`, `citations`.
+- `owned`/`inheritedFrom`/`editable`: `editable` is true only for an owned
+  description/constraint/tone note - the only kind of note the correction endpoint
+  accepts. The list comes straight from the location's own retrieval, which today only
+  yields notes the location owns (an ancestor's notes are inherited only when standing,
+  never scene-scoped), so `owned` is always `true` here at present. Don't offer
+  "Correct" on anything with `editable: false`.
+- `outOfRosterSceneRequirements`: scene-scoped notes whose `sceneId` is **not** one of
+  this location's linked scenes (`linked: false`, `number` null, `heading` is whatever
+  could be resolved or the raw id). They are surfaced rather than dropped, but they are
+  not linked scenes - don't render them as part of the scene list. Rare; usually means
+  a scene was relinked or a note was scoped to the wrong scene.
+- A standing note corrected into a scene leaves `descriptionNotes` etc. and appears
+  here immediately; correcting it back reverses that. Approvals already locked keep
+  their own snapshot and surface the change via `isStale`, as before.
+
 404 for an unknown id; 400 if `locationId` resolves to a scene, not a location.
 
 ### `GET /projects/{projectId}/locations/{locationId}/references?includeRejected=false`
@@ -302,8 +343,14 @@ review response) told you for that note.
 Response 200:
 ```json
 { "id": "note_...", "status": "confirmed", "revision": 1,
-  "reviewedBy": "jagan", "reviewedAt": "2026-...", "guidance": "canopy shape, not the bridge" }
+  "reviewedBy": "jagan", "reviewedAt": "2026-...", "guidance": "canopy shape, not the bridge",
+  "reviewReason": null }
 ```
+`reviewReason` is null here for an ordinary confirm/reject; it comes back `"corrected"`
+only for a note that `POST .../notes/{noteId}/correct` (below) replaced - this endpoint
+itself never sets that value, and rejecting a note here for an ordinary reason (`false`,
+`wrong_scope`, `duplicate`, `not_useful`, `other`) is unrelated to correction.
+
 Errors:
 - `404` - unknown note (or belongs to a different project).
 - `400` - e.g. rejecting without a reason, or guidance on a non-reference_image note.
@@ -314,6 +361,98 @@ Errors:
 - `403` - the request's `Origin` header (browsers set this automatically; nothing for
   the frontend to do) doesn't match the server's configured frontend origin. Should
   never happen from `location-studio` itself in normal operation.
+
+### `POST /projects/{projectId}/notes/{noteId}/correct`
+The human correction/split workflow for a `description`/`constraint`/`tone` note:
+fixing its wording or kind, moving it between "applies to the whole location" and "only
+during this scene", or splitting one note into a standing part and a scene-specific
+part - e.g. the reported case where "a framed photograph is present" (standing) and
+"reflected light obscures a face" (true only in one scene) were extracted as a single
+note. **Nothing does this automatically** - not extraction, not this endpoint on its
+own initiative; it only acts on an explicit request naming the exact new wording/scope.
+
+This never edits the note in place. It marks the original `rejected` (with
+`reviewReason: "corrected"`) and writes one or two brand-new notes as its replacement -
+mirroring how this system already treats a reviewed assertion as immutable once
+written (see "Deselecting a reference" below for the same principle applied to
+references). Ownership (`ownerId`) is **not** settable here and is always inherited
+from the note being corrected - moving a note to a different location is out of scope
+for this action.
+
+```json
+{ "successors": [
+    { "kind": "description", "body": "A framed photograph is present in the house." }
+  ],
+  "expectedRevision": 1, "expectedStatus": "proposed", "by": "director" }
+```
+One successor is a plain correction. Two is a split:
+```json
+{ "successors": [
+    { "kind": "description", "body": "A framed photograph is present in the house." },
+    { "kind": "description", "body": "Reflected light obscures a face in the photograph.",
+      "sceneId": "scn_8fc59f7f2860" }
+  ],
+  "expectedRevision": 1, "expectedStatus": "proposed", "by": "director" }
+```
+- `kind` must be `description`, `constraint`, or `tone` - the same kinds a brief note
+  can already be; this never creates a `reference_image` or `vocabulary` note, and the
+  note being corrected must itself already be one of these three (a reference image
+  has its own review flow, not this one).
+- `sceneId` (optional, per successor) - omit/null for "standing" (applies to the whole
+  location); set it to scope that successor to one specific scene already linked to
+  this location (the same set `GET .../locations/{locationId}` and the approval's own
+  `sceneRequirements` show) - `400` for a scene that doesn't belong to this location, or
+  doesn't exist. `includeDescendants` (optional, default `false`) works exactly like
+  every other note's `applicability.includeDescendants`.
+- Never edits or infers a citation - **the request has no field for that on purpose**.
+  Every successor's citations are copied verbatim from the original note; only `body`/
+  `kind`/scope are yours to set. This is what guarantees an edited/split note's wording
+  can never be mistaken for a different verbatim screenplay excerpt.
+- `expectedRevision`/`expectedStatus` are **both required**, same rationale as the
+  review endpoint above - a stale pair (someone else corrected or reviewed this note
+  since you read it) is a `409`, and **nothing is written**: your draft (the successors
+  you already typed) is not lost, just re-fetch the note and resubmit with its current
+  values.
+- A note that has been replaced by a correction can't be brought back through
+  `POST .../notes/{noteId}/review` either: confirming or rejecting it is a `400`
+  (`"...was replaced by a correction (note_x); review the replacement note instead"`),
+  or a `409` if your view of it is stale. Review the replacement instead; to undo a
+  correction, correct the replacement (e.g. back to standing) - the lineage keeps every
+  hop.
+- A note that's already `rejected` cannot be corrected - if your own `expectedStatus`
+  is `"rejected"`, that's a `400` (there's nothing live left to correct); if you
+  expected `"proposed"`/`"confirmed"` but it turns out to already be rejected, that's
+  the `409` case above instead, not this one.
+- Every new successor starts `status: "proposed"` - **it never inherits the original's
+  confirmation**, even if the original was confirmed. The wording/scope has changed, so
+  it needs its own review via the same `POST .../notes/{noteId}/review` endpoint.
+
+Response 200:
+```json
+{ "original": { "id": "note_...", "status": "rejected", "revision": 1,
+                "reviewedBy": "director", "reviewedAt": "2026-...", "guidance": null,
+                "reviewReason": "corrected" },
+  "newNotes": [ { "id": "note_...", "kind": "description",
+                  "body": "A framed photograph is present in the house.",
+                  "status": "proposed", "revision": 1, "citations": [...],
+                  "sceneId": null, "includeDescendants": false } ] }
+```
+`newNotes` is in the same order as the request's `successors`. `404`/`400`/`409`/`415`/
+`403` as in the review endpoint above.
+
+**Where this shows up elsewhere:**
+- `GET .../locations/{locationId}` and the approval endpoints stop showing the original
+  note immediately (it's `rejected`, excluded the same way any rejected note already
+  is) and start showing the new one(s) - no separate refresh step or cache to clear.
+- If the corrected note was part of an **already-locked** approval package,
+  `GET .../locations/{locationId}/approval`'s `isStale` becomes `true` with a
+  `staleReasons` entry naming the correction (see above) - the locked package itself is
+  untouched; re-lock to approve the corrected wording.
+- A later re-run of ingestion on the same screenplay **cannot** undo a correction: the
+  harness's existing reconciliation only ever touches its own machine-proposed notes
+  and already treats any non-`proposed` status (rejected included, for any reason) as a
+  durable human decision it will not overwrite - your correction's new note(s) aren't
+  machine-proposed at all, so re-ingestion doesn't even consider them.
 
 ### `POST /projects/{projectId}/locations/{locationId}/jobs`
 ```json
@@ -355,6 +494,303 @@ keep that client-side bound; it is the only timeout that exists for this call. T
 itself keeps running server-side regardless, and a later `GET` on the same job id will
 eventually show its real outcome.
 
+## Concept art and visual-direction approval
+
+Uploaded concept-art versions per location, and an explicit lock of one version + the
+brief/context + selected references as the approved visual direction. **No image
+generation of any kind exists here** - every version is something a human uploaded;
+see "Not yet built" below for the Luma/generation boundary. **No 3D/Astra call exists
+here either** - `GET .../approval` is only the retrieval a later, separate "Send to 3D
+blockout" action would read from; nothing in this section calls out anywhere or marks
+a package as sent.
+
+Concept art is never a reference card and never appears in `GET .../references` or
+`GET /sources` - it is a wholly separate record from both, even when it happens to
+share the exact same image bytes as one of them (content-addressed dedup applies
+across concept/reference/ingest uploads alike - uploading the same file three ways
+still stores the bytes once). Sharing bytes with a reference or an ingested screenplay
+page never makes a concept image ingest-eligible or reference-listable on its own, and
+the reverse holds too: uploading a concept image never affects an existing reference
+note or ingested source's own state. The one exception, matching how a reference image
+already behaves: if the *same bytes* are later explicitly uploaded through
+`POST /projects/{id}/sources` (the ingestion upload), that source becomes
+ingest-eligible from that point on (`GET /sources` will list it) - this is the existing
+promotion path applying uniformly, not something specific to concept art, and it never
+retroactively changes the concept version record pointing at those bytes.
+
+### `POST /projects/{projectId}/locations/{locationId}/concepts/upload?filename=...`
+Same upload convention as `.../references/upload` above: raw image bytes
+(`image/jpeg | image/png | image/webp`), `filename` as a query parameter, one image per
+request. Uploading (or, client-side, merely looking at) a version **never** approves it
+- only the lock endpoint below does, and it never resets an existing approval either.
+
+Response `201`:
+```json
+{ "id": "cvn_...", "image": "/projects/prj_.../concepts/cvn_.../image",
+  "filename": "mill_v2.jpg", "created": true, "approved": false }
+```
+- `created: false` - identical bytes were already uploaded as a version for this
+  location; the existing version is returned (content-addressed dedup, like sources and
+  reference uploads - a re-upload is always a safe no-op, never a duplicate version).
+- `approved` - true iff this version is the location's currently locked one.
+- `404` unknown project/location; `400` unsupported/invalid image, empty body, or a
+  scene id (concept art is per location only); `413` over the size limit.
+
+### `GET /projects/{projectId}/locations/{locationId}/concepts`
+```json
+{ "locationId": "loc_...", "approvedVersionId": "cvn_a1b2c3",
+  "versions": [
+    { "id": "cvn_a1b2c3", "image": "/projects/.../concepts/cvn_a1b2c3/image",
+      "filename": "mill_v1.jpg", "createdAt": "2026-...", "author": "user", "approved": true },
+    { "id": "cvn_d4e5f6", "image": "/projects/.../concepts/cvn_d4e5f6/image",
+      "filename": "mill_v2.jpg", "createdAt": "2026-...", "author": "user", "approved": false }
+  ] }
+```
+Oldest first. Use `approvedVersionId`/`approved` to badge the locked version distinctly
+from plain candidates. **"Selecting a candidate" is purely client-side state** - there
+is nothing to call here for that; only the lock endpoint below persists anything.
+
+### `GET /projects/{projectId}/concepts/{conceptVersionId}/image`
+Streams the bytes (same rationale as `GET .../references/{noteId}/image` - no signing
+key under local dev ADC). `404` for an unknown version or project.
+
+### `POST /projects/{projectId}/locations/{locationId}/concepts/from-reference`
+```json
+{ "referenceId": "note_a1b2c3" }
+```
+Creates a concept-candidate version from an **existing, applicable reference image** -
+no bytes are downloaded or re-uploaded through the browser; the new version points
+directly at the reference's own already-stored image. Response shape and semantics are
+identical to `POST .../concepts/upload` above (`ConceptUploadOut`, always `201`,
+`created`/`approved` mean the same thing), plus two extra fields:
+```json
+{ "id": "cvn_...", "image": "/projects/.../concepts/cvn_.../image", "filename": "mill_ref.jpg",
+  "created": true, "approved": false,
+  "promotedFromNoteId": "note_a1b2c3", "promotedFromNoteRevision": 1 }
+```
+- Both `promotedFrom*` fields are `null` for a version created via a raw
+  `.../concepts/upload` instead.
+- Permits a `proposed` **or** `confirmed` reference - creating a candidate is
+  exploratory, it is not an approval decision. A `rejected` reference is refused:
+  `400` `"'note_a1b2c3' is rejected and cannot be promoted to a concept candidate"`.
+- `400` `"'note_x' is not a reference applicable to location {locationId}"` for an
+  unrelated/unknown reference id (same ownership/inheritance rule as everywhere else
+  in this section - owned, or inherited from a confirmed ancestor).
+- **Never confirms, rejects, or otherwise mutates the reference note** - this reads it,
+  it does not review it. The reference's own status/revision are completely
+  unaffected; review it independently via `POST .../notes/{noteId}/review` as always.
+- **Never touches any existing approval** - exactly like a raw upload, promoting a new
+  candidate leaves whatever is currently locked alone until an explicit lock says
+  otherwise.
+- **This is a separate action from selecting a reference as supporting evidence.**
+  Using reference X's image as the concept *candidate* (this endpoint,
+  `concept_version_id`) and selecting reference X itself as a *confirmed supporting
+  reference* for the approval package (`POST .../approval/lock`'s `referenceIds`,
+  which still requires `confirmed` - see below) are independent: nothing stops the
+  same reference note from playing both roles, or either alone.
+- Idempotent and concurrency-safe the same way uploads are: retrying, or two
+  concurrent promotions of the same reference (or a promotion racing a raw upload of
+  the same bytes), all resolve to one version record. Whichever call's provenance was
+  recorded first is never overwritten by a second, different-purpose call that happens
+  to resolve to the same underlying image.
+- `404` unknown project/location; `400` a scene id.
+
+### `GET /projects/{projectId}/locations/{locationId}/approval/preview?conceptVersionId=...&referenceIds=...&depictionLabel=...`
+Read-only - persists nothing. Shows exactly what a lock right now would capture for a
+given candidate + an explicit reference selection (`referenceIds` repeated as a query
+param, e.g. `?referenceIds=note_a&referenceIds=note_b`; omit for none) + an optional
+depiction label. Call this before showing a "lock this as approved" confirmation, and
+again if the candidate, selection, or label changes.
+```json
+{
+  "locationId": "loc_...", "conceptVersionId": "cvn_a1b2c3",
+  "conceptImage": "/projects/.../concepts/cvn_a1b2c3/image", "conceptFilename": "mill_v1.jpg",
+  "depictionLabel": "whole-house exterior",
+  "coreNotes": [ /* same shape as GET .../locations/{id}'s descriptionNotes - kind
+                   "description"/"tone", unconditional (no scene) */ ],
+  "coreNotesCaveat": "These are the location's own standing notes ... that distinction
+                       needs human review ... nothing here infers or rewrites that
+                       automatically.",
+  "physicalNotes": [ /* kind "constraint", unconditional - physical/set-dressing */ ],
+  "sceneRequirements": [
+    { "sceneId": "scn_c7d4...", "number": "4", "heading": "4. INT. ANSHUL'S HOUSE - NIGHT", "notes": [] },
+    { "sceneId": "scn_8fc5...", "number": "7", "heading": "7. INT./EXT. PANDIT'S DREAM - NIGHT",
+      "notes": [ /* description/constraint/tone notes scoped to this scene */ ] },
+    { "sceneId": "scn_0201...", "number": "10", "heading": "10. EXT. ANSHUL'S HOUSE / DEVGRAM LANES - MORNING", "notes": [] }
+  ],
+  "briefInherited": [{ "entityId": "loc_...", "name": "Devgram", "notes": [...] }],
+  "briefAncestors": ["Devgram"], "supersededSources": [],
+  "references": [{ "noteId": "note_...", "revision": 1, "status": "confirmed",
+                   "guidance": null, "direction": null, "caption": "Stone mill with wheel.",
+                   "image": "/projects/.../references/note_.../image" }],
+  "contextToken": "9f3a...e21c"
+}
+```
+**Structured sections, reusing existing fields - see "Brief sectioning" below for the
+full rationale.** `coreNotes` and `physicalNotes` replace the old flat `briefNotes`;
+`sceneRequirements` replaces `briefConditional` and now **always lists every scene
+linked to this location** (`GET .../locations/{id}`'s own linked-scene roster,
+reused, not recomputed) **regardless of whether that scene has any requirements** -
+`notes: []` on a roster entry is a real fact ("nothing scene-specific was extracted for
+this scene"), never an omission, as long as you got it from *this* endpoint (a
+preview is always complete/current - see `sceneCoverageComplete` on
+`GET .../approval` below for the one place that isn't always true).
+
+`depictionLabel` (optional, ≤200 chars after trimming) is a small free-text
+description of what the image depicts - e.g. `"whole-house exterior"`,
+`"bedroom interior - top view"`. Purely descriptive: never inferred, never checked
+against any room/location relationship, never a claim of spatial accuracy, and never
+changes which location the concept version itself belongs to. `400` if over length.
+
+**Every `referenceId` must be both `confirmed` and applicable to this location** through
+the same ownership/inheritance rule `GET .../references` already uses (owned, or
+inherited from a confirmed ancestor with `includeDescendants`) - unchanged from before,
+and distinct from `.../concepts/from-reference` above, which allows `proposed` too
+because it isn't approving anything. This never confirms anything - it is a read-only
+gate on what may be *selected*, not a side effect:
+- `400` `"'note_x' is proposed, not confirmed; only confirmed references may be selected
+  for approval"` - the note exists here but hasn't been confirmed yet. Confirm it first
+  via `POST /projects/{projectId}/notes/{noteId}/review`, then retry.
+- `400` `"'note_x' is rejected, not confirmed; ..."` - same, for a rejected note.
+- `400` `"'note_x' is not a reference applicable to location {locationId}"` - the note
+  doesn't belong to this location at all (wrong location, or a note that isn't a
+  reference), regardless of its status.
+- `404` unknown location/concept version; `400` a scene id.
+
+Duplicate `referenceIds` are silently deduplicated.
+
+**Brief sectioning (why these fields, and what they don't claim).** Extraction stores
+notes with a `kind` (`description | constraint | tone | ...`) and an `applicability`
+(`scene_id`, `includeDescendants`) - this endpoint reuses exactly those existing fields
+to sort into "core description" (`description`/`tone`, unconditional), "physical/
+set-dressing" (`constraint`, unconditional - the system's existing structured slot for
+standing requirements), "scene-specific" (any kind, scoped to a scene), and "inherited"
+(owned by a confirmed ancestor). **What this sectioning does not do**: it does not
+reclassify anything using keyword rules, and it does not resolve every ambiguity - a
+note can describe a standing physical fact ("family photographs decorate the space")
+and a scene/camera-specific visual detail ("...one photo's reflection hides a face") in
+the same sentence, with the same `kind` and no `scene_id` either way. Nothing in this
+data model distinguishes those two today, so such a note lands in `coreNotes` as-is
+(never dropped, never guessed into a scene) and `coreNotesCaveat` says so explicitly.
+If a note turns out to actually be scene-specific - or mixes a standing fact with a
+scene-specific one in the same sentence - the fix is `POST /projects/{projectId}/notes/{noteId}/correct`
+(see "Correcting a note" below), never something this or any other endpoint infers
+automatically.
+
+### `POST /projects/{projectId}/locations/{locationId}/approval/lock`
+```json
+{ "conceptVersionId": "cvn_a1b2c3", "referenceIds": ["note_a", "note_b"],
+  "depictionLabel": "whole-house exterior",
+  "contextToken": "9f3a...e21c", "expectedRevision": 0, "by": "director" }
+```
+`depictionLabel` is optional (omit, `null`, or `""` all mean "no label"). `contextToken`
+and `expectedRevision` are **both required**, and guard two different things:
+- `contextToken` - must match what a fresh preview computes for this exact
+  `(conceptVersionId, referenceIds, depictionLabel)` right now - changing the label
+  between preview and lock moves the token like any other change. A mismatch means the
+  brief, scene roster, a selected reference, or the label changed since you fetched the
+  preview - `409`, **re-fetch the preview and retry**, never resend the same token.
+  The token also covers each scene's own identity (id, number, heading) - relinking a
+  scene to/from this location, or renaming/renumbering one, moves the token even if
+  that scene has no notes at all.
+- `expectedRevision` - the `revision` last seen from `GET .../approval` (`0` if none
+  exists yet). A mismatch means someone else's lock is now current - `409`, **re-fetch
+  `GET .../approval` and retry**.
+
+Retrying the exact same request is safe: if the package you're locking is already
+exactly the current one (by `contextToken`), the call succeeds as a no-op regardless of
+`expectedRevision` - `created: false`, same approval returned, no new revision. That
+idempotency check happens atomically, alongside the revision check, inside the same
+commit - never as a separate pre-check that could itself race.
+
+**What "approved" actually means here - the exact validation/commit boundary.** The
+`contextToken` check above happens *once*, against a fresh read, before anything is
+written. What gets committed is built directly from that same validated read - never a
+second, independently re-fetched copy. The commit itself (the atomic step that makes a
+package "current") does **not** re-read notes or re-check freshness; it only guards
+(a) idempotency by token equality and (b) the `expectedRevision` race between two
+*concurrent lock attempts*. So: **this endpoint approves the exact snapshot you
+previewed and got a token for - not "whatever the absolute latest state happens to be"
+at the instant the write lands.** In this single-process local slice there is a real
+but narrow window between the token check and the commit where a concurrent edit could
+still land; nothing in that window is silently absorbed into what gets approved, and
+nothing re-derives a "fresher" version to compile instead. Any drift that happened in
+that window is never hidden - it shows up immediately afterward as `isStale`/
+`staleReasons` on `GET .../approval` below, exactly as if the edit had happened a
+minute later. Treat a `409` here as "go re-fetch," never as a promise that what gets
+approved is instantaneously fresh at the moment of the write.
+
+Response `201` (`created: true`) or `200` (`created: false`, idempotent no-op):
+```json
+{ "created": true, "approval": {
+  "id": "apr_...", "locationId": "loc_...", "revision": 1,
+  "conceptVersionId": "cvn_a1b2c3", "conceptImage": "/projects/.../concepts/cvn_a1b2c3/image",
+  "conceptFilename": "mill_v1.jpg", "depictionLabel": "whole-house exterior",
+  "coreNotes": [...], "coreNotesCaveat": "...", "physicalNotes": [...],
+  "sceneRequirements": [...], "sceneCoverageComplete": true,
+  "briefInherited": [...], "briefAncestors": ["Devgram"], "supersededSources": [],
+  "references": [...], "contextToken": "9f3a...e21c",
+  "lockedBy": "director", "lockedAt": "2026-..." } }
+```
+`lockedBy` is whatever free text `by` was sent (default `"user"`) - **not an
+authenticated identity**; this system has no login. Never writes to a note - the
+brief/reference data above is a snapshot of what was seen, not a confirmation of it -
+and every `references[]` entry here is always `status: "confirmed"` (see the preview
+call above: only a confirmed, applicable reference can be selected in the first place).
+`sceneCoverageComplete` is always `true` for anything locked from now on (`false` is
+only possible on a package locked before this slice - see "Scene coverage and backward
+compatibility" below). `404`/`400` as in the preview call above.
+
+### `GET /projects/{projectId}/locations/{locationId}/approval`
+```json
+{ "locationId": "loc_...", "revision": 1, "isStale": false,
+  "staleReasons": [],
+  "approval": { /* same shape as the lock response's "approval" above, or null if nothing has ever been locked */ } }
+```
+Use `revision` as the next lock's `expectedRevision`. `isStale: true` means the brief,
+scene roster, a selected reference, or the depiction label has changed since this exact
+package was locked - the stored snapshot itself is **never** rewritten by that; show
+the user that a new approval is needed for an updated package rather than re-deriving
+one. `staleReasons` is a list of human-readable strings (empty when `isStale` is
+`false`), one per divergence found, e.g.:
+- `"a note in the brief (note_x) changed since this was approved (was revision
+  1/proposed, now 2/confirmed)"`
+- `"a note in the brief (note_x) was corrected since this was approved - replaced by:
+  note_y"` (see "Correcting a note" below - the original still exists, just excluded
+  from retrieval like any rejected note; this is worded distinctly from a plain
+  `"...was removed..."`, which means the note is genuinely gone, not superseded)
+- `"1 new note in scene 7 since this was approved"`
+- `"reference note_y is no longer confirmed (now rejected)"`
+- `"reference note_y no longer applies to this location"` (removed, or its inheritance
+  no longer reaches here)
+- `"scene scn_x heading/number changed since this was approved (was '4' '4. INT. ...',
+  now '4' '4. INT. ... - REVISED')"` / `"1 newly linked scene since this was approved"`
+- `"the approved location was rejected"` / `"...was merged into loc_z"`
+
+Treat these as explanatory text for a UI banner, not a stable enum to branch logic on -
+the exact wording may change; only `isStale`'s boolean should drive behavior.
+
+**This call always succeeds and returns the stored package, even when everything about
+it has since diverged** - a rejected/deleted reference, an edited brief/scene note, a
+relinked/renamed scene, or even the location itself having been later rejected or
+merged. It never fails the whole retrieval over that; it explains it instead.
+
+**Scene coverage and backward compatibility.** `sceneCoverageComplete` on the nested
+`approval` distinguishes two eras of data:
+- `true` (everything locked from now on): `sceneRequirements` always lists every scene
+  currently linked to this location at lock time, so an empty `notes: []` on an entry
+  is a confirmed fact, and a scene simply missing from the list means it wasn't linked
+  at lock time - not "extraction found nothing."
+- `false` (only possible on a package locked before this slice): `sceneRequirements`
+  only ever listed scenes that happened to have a scene-conditional note at lock time -
+  a scene absent from that old list may just never have been captured, not confirmed
+  empty. `staleReasons` will always include one explicit line naming this
+  (`"...predates full scene-roster coverage..."`) instead of a detailed scene-by-scene
+  diff, which would otherwise misreport every uncaptured scene as "newly linked."
+  Old approvals are never rewritten to backfill this - re-lock (a fresh preview + lock)
+  to get a `sceneCoverageComplete: true` package. `depictionLabel` needs no such flag:
+  `null` on old data has always correctly meant "no label was given."
+
 ## Frontend changes required (not yet made - this is the handoff, not a description of
 ## current `location-studio` code)
 
@@ -390,10 +826,18 @@ eventually show its real outcome.
    - Brief tab: in Phase 1, render `descriptionNotes`/`constraintNotes`/`toneNotes` as a
      read-only list (with citations), not the editable `textarea`s bound to IndexedDB.
      There is no "open questions" data from the harness yet (no such note kind exists) -
-     leave that field empty/hidden rather than inventing content for it.
-   - Chat panel, concept upload/generation, and multi-project switching are unchanged
-     from today's local-only behavior in Phase 1 - none of that is implemented
-     server-side yet (see "Not yet built").
+     leave that field empty/hidden rather than inventing content for it. **Add a
+     "Correct this note" action per note** (each already carries its own `id`,
+     `revision`, `status`, `sceneId`) that opens a small form calling
+     `POST .../notes/{noteId}/correct` (see above) - one text field (+ kind, + an
+     optional "only during scene" picker) for a plain correction, or "split into two"
+     to show a second set of the same fields. Never let the UI edit a citation/quote -
+     the request has no field for that. On `409`, show the conflict and let the user
+     re-open the form with the note's current values rather than silently discarding
+     what they typed.
+   - Chat panel and multi-project switching are unchanged from today's local-only
+     behavior in Phase 1 - neither is implemented server-side yet (see "Not yet
+     built"). Concept upload/approval **is** now implemented server-side - see item 5.
 
 4. **New surface, not a modification**: nothing in today's `location-studio` creates a
    project or uploads a screenplay - the create → upload → ingest → poll flow above has
@@ -409,16 +853,70 @@ eventually show its real outcome.
      authoritatively, the same way an in-flight ingest job is reconnected via its saved
      job id rather than client memory.
 
+5. **New surface: concept art and lock-in**, replacing today's local-only
+   concept-upload placeholder in `location-studio`:
+   - A versions strip/gallery per location: file picker(s) calling
+     `POST .../concepts/upload` per file, then `GET .../concepts` on load/reload -
+     don't trust the upload response to survive a refresh, same reload rule as Sources.
+     Badge the version matching `approvedVersionId` distinctly from plain candidates.
+     Each version's `promotedFromNoteId` (non-null when created via `from-reference`
+     below) can badge it as "from reference" if useful, but isn't required for the
+     core flow.
+   - **A "use as candidate" action on each reference card** (in the references
+     panel, not just the concepts gallery): calls `POST .../concepts/from-reference`
+     with that reference's id, then refreshes `GET .../concepts`. Unlike the
+     concepts-upload picker, this is available for a `proposed` reference too (not
+     only confirmed) - creating a candidate is exploratory. A `400` for a rejected
+     reference is an edge case (the UI should already prevent picking a rejected
+     card for this) - show its message rather than a generic error.
+   - "Select a candidate" is client-side only (which version + which references are
+     checked in the UI) - no API call until the user explicitly locks.
+   - **Only confirmed references are selectable as *supporting evidence* for the
+     approval** (the lock's `referenceIds` - distinct from using a reference as the
+     *candidate image* above, which allows proposed). Filter that specific picker to
+     `status === "confirmed"` client-side, so the user never hits the preview/lock
+     endpoints' `400` for a proposed/rejected pick in normal use - that response
+     exists for correctness, not as a UI-driven flow.
+   - **An optional small text input for the depiction label** ("whole-house
+     exterior", "bedroom interior - top view") alongside the candidate/reference
+     picker - plain text, no validation beyond a ~200-char limit enforced
+     server-side. Never a room/location picker; it's a caption, not a relationship.
+   - Before locking: call `GET .../approval/preview` with the selected
+     `conceptVersionId`/`referenceIds`/`depictionLabel` and show that snapshot as the
+     confirmation ("this is what will be approved") - render `coreNotes` and
+     `physicalNotes` as two distinct groups (with `coreNotesCaveat` as helper text
+     under the first), and `sceneRequirements` as one row per scene including the
+     ones with an empty requirements list (don't filter those out - their presence is
+     the point). Then `POST .../approval/lock` with its `contextToken` and the
+     `revision` last read from `GET .../approval` (`0` first time).
+   - On `409`: re-fetch (`.../approval/preview` for a stale token, `.../approval` for a
+     stale revision) and let the user retry - never resend the same body.
+   - On reload, `GET .../approval` is authoritative for what's currently locked; it
+     always returns the stored package even when it has drifted. Render `isStale: true`
+     using `staleReasons` (e.g. "reference X is no longer confirmed - re-lock to
+     update") rather than a generic message, and never silently re-approve. If
+     `approval.sceneCoverageComplete` is `false`, show a one-line note that this
+     package predates full scene coverage rather than trusting its scene list as
+     exhaustive (staleReasons already says this too, but it's worth a persistent
+     badge, not just a transient banner).
+   - Do **not** wire a "Send to 3D blockout" button to anything yet - there is nothing
+     on the other end (see "Not yet built").
+
 ## Not yet built (do not assume these exist)
 
-- **Concept generation.** No image-generation pipeline exists in the harness at all.
-  `POST .../jobs {"kind": "concept"}` returns `501` on purpose.
+- **Concept generation.** No image-generation pipeline exists in the harness at all -
+  every concept version is a human upload (`POST .../concepts/upload`, above). Luma is
+  not integrated and there is no fake generation endpoint standing in for it; provider
+  and model selection are a separate, later piece of work. `POST .../jobs {"kind":
+  "concept"}` still returns `501` on purpose.
+- **"Send to 3D blockout."** `GET .../locations/{id}/approval` (above) is the retrieval
+  boundary a later explicit action would read from - nothing calls Astra, invents its
+  API, or marks a package as sent. That later action does not exist yet.
 - **Chat.** No endpoint exists yet. Would be new code (context retrieval + a fresh model
   call), not a "connection" to something already there.
-- **Working-brief editing/approval**, separate from the extracted notes above.
-- **Reference/concept image uploads** (visual inspiration / concept art). Screenplay and
-  notes uploads for ingestion (`POST /projects/{id}/sources`, above) exist; reference
-  and concept image uploads are a separate, still-unbuilt thing.
+- **Working-brief editing.** The extracted notes above (`GET .../locations/{id}`) are
+  still read-only in Phase 1; concept-art approval (above) is a separate, now-built
+  thing layered on top of that same read-only brief, not an editor for it.
 - **Document revisions** (`supersedes`/`revisionLabel` - the CLI's `drop --supersedes`
   equivalent). `register_file` already supports it; the upload endpoint deliberately
   doesn't expose it yet - no UI for it either.
